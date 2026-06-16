@@ -69,13 +69,17 @@ export class MetadataStore {
     this.ensureEntity(target);
     const meta = this.entities.get(target)!;
     const existing = meta.relations.get(propertyKey);
+
+    const reflectJoinTable = Reflect.getMetadata(`orm:joinTable:${propertyKey}`, target);
+    const reflectJoinColumn = Reflect.getMetadata(`orm:joinColumn:${propertyKey}`, target);
+
     const merged: RelationMetadata = {
       propertyKey,
       type: relation.type,
       targetEntity: relation.targetEntity,
-      foreignKey: relation.foreignKey,
-      joinTable: relation.joinTable,
-      joinColumn: relation.joinColumn,
+      foreignKey: relation.foreignKey || reflectJoinColumn,
+      joinTable: relation.joinTable || reflectJoinTable,
+      joinColumn: relation.joinColumn || reflectJoinColumn,
       inverseJoinColumn: relation.inverseJoinColumn,
       mappedBy: relation.mappedBy,
       isLazy: relation.isLazy ?? true,
@@ -128,7 +132,7 @@ export class MetadataStore {
     }
   }
 
-  private snakeCase(str: string): string {
+  snakeCase(str: string): string {
     return str
       .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
       .replace(/([a-z\d])([A-Z])/g, '$1_$2')

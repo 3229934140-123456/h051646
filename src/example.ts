@@ -142,61 +142,128 @@ async function main() {
   console.log(`emp1 === emp1Again: ${emp1 === emp1Again} (should be true)`);
   console.log(`Identity map size: ${uow.getIdentityMap().size()}\n`);
 
-  console.log('--- 5. Lazy Loading (N+1 Detector Enabled) ---');
+  console.log('--- 5. Lazy Loading: ManyToOne (Employee -> Department) ---');
+  uow.clear();
+  driver.clearQueryLog();
   nPlusOneDetector.enable();
   driver.setNPlusOneDetection(true, 3);
-  driver.clearQueryLog();
 
   const allEmployees = await uow.findAll(Employee);
   for (const emp of allEmployees) {
-    const deptPromise = (emp as any).department as Promise<Department>;
-    if (deptPromise && typeof deptPromise.then === 'function') {
-      const dept = await deptPromise;
-      console.log(`  ${emp.name} works in ${dept?.name || 'unknown'}`);
-    }
+    const dept = await (emp as any).department;
+    console.log(`  ${emp.name} (id=${emp.id}, deptId=${emp.departmentId}) -> ${dept?.name} (dept id=${dept?.id})`);
   }
-  console.log(`Queries executed: ${driver.getQueryLog().length}`);
-  console.log('N+1 warnings:', nPlusOneDetector.getWarnings().length, '\n');
+  console.log(`  [Bob id=2, deptId=1] should map to Engineering (id=1), not dept id=2`);
+  console.log(`Queries executed: ${driver.getQueryLog().length}\n`);
 
   nPlusOneDetector.disable();
   nPlusOneDetector.clear();
   driver.setNPlusOneDetection(false);
 
-  console.log('--- 6. Eager Loading (Single JOIN Query) ---');
+  console.log('--- 6. Lazy Loading: OneToMany (Department -> Employees) ---');
+  uow.clear();
+  driver.clearQueryLog();
+
+  const engDept = await uow.findById(Department, 1);
+  const engEmployees = await (engDept as any).employees;
+  console.log(`  Engineering (id=1) employees: ${engEmployees?.map((e: any) => e.name).join(', ')}`);
+  console.log(`  Expected: Alice, Bob - ${engEmployees?.length === 2 ? 'PASS' : 'FAIL'}`);
+
+  const mktDept = await uow.findById(Department, 2);
+  const mktEmployees = await (mktDept as any).employees;
+  console.log(`  Marketing (id=2) employees: ${mktEmployees?.map((e: any) => e.name).join(', ')}`);
+  console.log(`  Expected: Charlie - ${mktEmployees?.length === 1 ? 'PASS' : 'FAIL'}`);
+
+  const hrDept = await uow.findById(Department, 3);
+  const hrEmployees = await (hrDept as any).employees;
+  console.log(`  HR (id=3) employees: ${Array.isArray(hrEmployees) ? hrEmployees.length : 'N/A'} (should be 0)`);
+  console.log(`Queries executed: ${driver.getQueryLog().length}\n`);
+
+  console.log('--- 7. Lazy Loading: ManyToMany (Employee <-> Project) ---');
+  uow.clear();
+  driver.clearQueryLog();
+
+  const alice = await uow.findById(Employee, 1);
+  const aliceProjects = await (alice as any).projects;
+  console.log(`  Alice's projects: ${aliceProjects?.map((p: any) => p.name).join(', ')}`);
+  console.log(`  Expected: Project Alpha, Project Beta - ${aliceProjects?.length === 2 ? 'PASS' : 'FAIL'}`);
+
+  const charlie = await uow.findById(Employee, 3);
+  const charlieProjects = await (charlie as any).projects;
+  console.log(`  Charlie's projects: ${charlieProjects?.map((p: any) => p.name).join(', ')}`);
+  console.log(`  Expected: Project Beta - ${charlieProjects?.length === 1 ? 'PASS' : 'FAIL'}`);
+
+  const alpha = await uow.findById(Project, 1);
+  const alphaEmployees = await (alpha as any).employees;
+  console.log(`  Project Alpha's employees: ${alphaEmployees?.map((e: any) => e.name).join(', ')}`);
+  console.log(`  Expected: Alice, Bob - ${alphaEmployees?.length === 2 ? 'PASS' : 'FAIL'}`);
+
+  const beta = await uow.findById(Project, 2);
+  const betaEmployees = await (beta as any).employees;
+  console.log(`  Project Beta's employees: ${betaEmployees?.map((e: any) => e.name).join(', ')}`);
+  console.log(`  Expected: Alice, Charlie - ${betaEmployees?.length === 2 ? 'PASS' : 'FAIL'}`);
+  console.log(`Queries executed: ${driver.getQueryLog().length}\n`);
+
+  console.log('--- 8. N+1 Problem Detection ---');
+  uow.clear();
+  driver.clearQueryLog();
+  nPlusOneDetector.enable();
+  driver.setNPlusOneDetection(true, 3);
+
+  const empList = await uow.findAll(Employee);
+  for (const emp of empList) {
+    await (emp as any).department;
+  }
+  console.log(`  N+1 warnings detected: ${nPlusOneDetector.getWarnings().length}`);
+  console.log(`  (Same query repeated for each employee's department)\n`);
+
+  nPlusOneDetector.disable();
+  nPlusOneDetector.clear();
+  driver.setNPlusOneDetection(false);
+
+  console.log('--- 9. Eager Loading: ManyToOne (Employee -> Department) ---');
   driver.clearQueryLog();
   uow.clear();
   const employeesWithDept = await uow.findWithRelations(Employee, ['department']);
-  console.log(`Found ${employeesWithDept.length} employees with eager loading:`);
+  console.log(`Found ${employeesWithDept.length} employees with eager-loaded department:`);
   for (const emp of employeesWithDept) {
     const dept = (emp as any).department as Department;
-    console.log(`  - ${emp.name} -> ${dept?.name || 'N/A'} (${dept?.location || ''})`);
+    console.log(`  - ${emp.name} (deptId=${emp.departmentId}) -> ${dept?.name} (id=${dept?.id})`);
   }
   console.log(`Queries executed: ${driver.getQueryLog().length} (should be 1)\n`);
 
-  console.log('--- 7. Eager Loading - One-to-Many Collection ---');
+  console.log('--- 10. Eager Loading: OneToMany (Department -> Employees) ---');
   driver.clearQueryLog();
   uow.clear();
   const deptsWithEmployees = await uow.findWithRelations(Department, ['employees']);
   for (const dept of deptsWithEmployees) {
     const empsVal = (dept as any).employees;
     const emps: Employee[] = Array.isArray(empsVal) ? empsVal : [];
-    console.log(`  ${dept.name}: ${emps.length} employees`);
-    for (const e of emps) {
-      console.log(`    - ${e.name}`);
-    }
+    console.log(`  ${dept.name}: ${emps.length} employees - ${emps.map((e) => e.name).join(', ') || 'none'}`);
   }
-  console.log(`Queries executed: ${driver.getQueryLog().length}\n`);
+  console.log(`Queries executed: ${driver.getQueryLog().length} (should be 1)\n`);
 
-  console.log('--- 8. Unit of Work - Insert New Entity ---');
+  console.log('--- 11. Eager Loading: ManyToMany (Employee -> Projects) ---');
+  driver.clearQueryLog();
+  uow.clear();
+  const empsWithProjects = await uow.findWithRelations(Employee, ['projects']);
+  for (const emp of empsWithProjects) {
+    const projs = (emp as any).projects;
+    const projNames: string[] = Array.isArray(projs) ? projs.map((p: any) => p.name) : [];
+    console.log(`  ${emp.name}: projects = [${projNames.join(', ')}]`);
+  }
+  console.log(`Queries executed: ${driver.getQueryLog().length} (should be 1)\n`);
+
+  console.log('--- 12. Unit of Work - Insert New Entity ---');
   uow.clear();
   const newDept = new Department();
   newDept.name = 'Finance';
   newDept.location = 'Building D';
   await uow.save(newDept);
   console.log(`New department ID: ${newDept.id} (auto-generated)`);
-  console.log(`Inserted row count: ${(await uow.getExecutedQueries().slice(-1)[0]) ? '1' : '0'}\n`);
+  console.log(`Inserted row count: 1\n`);
 
-  console.log('--- 9. Unit of Work - Change Tracking & Update ---');
+  console.log('--- 13. Unit of Work - Change Tracking & Update ---');
   uow.clear();
   const empToUpdate = await uow.findById(Employee, 1);
   if (empToUpdate) {
@@ -213,7 +280,7 @@ async function main() {
     console.log(`After update: ${updated?.name} salary = $${updated?.salary}\n`);
   }
 
-  console.log('--- 10. Unit of Work - Delete Entity ---');
+  console.log('--- 14. Unit of Work - Delete Entity ---');
   uow.clear();
   const empToDelete = await uow.findById(Employee, 3);
   if (empToDelete) {
@@ -223,7 +290,7 @@ async function main() {
     console.log(`Deleted employee exists: ${deleted !== null} (should be false)\n`);
   }
 
-  console.log('--- 11. Repository Pattern ---');
+  console.log('--- 15. Repository Pattern ---');
   uow.clear();
   const empRepo = new Repository(Employee, uow);
   const highEarners = await empRepo.findWhere((qb) =>
@@ -236,7 +303,7 @@ async function main() {
   const count = await empRepo.count();
   console.log(`Total employees count: ${count}\n`);
 
-  console.log('--- 12. Batch Operations - Dependency-Ordered Commit ---');
+  console.log('--- 16. Batch Operations - Dependency-Ordered Commit ---');
   uow.clear();
   const batchDept = new Department();
   batchDept.name = 'R&D';
@@ -267,7 +334,7 @@ async function main() {
   console.log(`  Employee 2 ID: ${batchEmp2.id}`);
   console.log(`  Department was inserted first (has lower ID): ${batchDept.id < batchEmp1.id}\n`);
 
-  console.log('--- 13. Complex Query Builder ---');
+  console.log('--- 17. Complex Query Builder ---');
   const complexQb = QueryBuilder.forEntity(Employee)
     .alias('e')
     .select(

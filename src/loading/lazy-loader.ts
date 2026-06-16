@@ -39,23 +39,10 @@ export function createLazyProxy<T extends object>(
 
       switch (relation.type) {
         case 'many-to-one': {
-          const fkProp = relation.mappedBy || relation.foreignKey ||
-            targetMeta.primaryKeys[0];
-          const fkCol = relation.foreignKey ||
-            (ownerMeta.columns.has(fkProp)
-              ? ownerMeta.columns.get(fkProp)!.columnName
-              : fkProp);
-
           const ownerObj = ownerEntity as Record<string, any>;
-          let fkValue: any;
-          if (ownerMeta.columns.has(fkProp)) {
-            fkValue = ownerObj[fkProp];
-          } else {
-            const targetPkCol = targetMeta.columns.get(targetMeta.primaryKeys[0])!.columnName;
-            fkValue = ownerObj[targetPkCol];
-          }
+          const fkValue = resolveManyToOneFkValue(relation, ownerMeta, targetMeta, ownerObj);
 
-          if (!fkValue) {
+          if (fkValue === null || fkValue === undefined) {
             cache = null;
             loaded = true;
             return cache;
@@ -75,21 +62,7 @@ export function createLazyProxy<T extends object>(
         case 'one-to-many': {
           const inverseClass = targetClass;
           const inverseMeta = metadataStore.getEntityMetadataOrThrow(inverseClass);
-          const mappedBy = relation.mappedBy!;
-          const inverseRel = inverseMeta.relations.get(mappedBy);
-
-          let fkColumn: string;
-          if (inverseRel?.foreignKey) {
-            fkColumn = inverseRel.foreignKey;
-          } else {
-            const ownerPkProp = ownerMeta.primaryKeys[0];
-            fkColumn = metadataStore.getColumnName(ownerClass, ownerPkProp);
-            fkColumn = fkColumn.replace('id', '_id');
-            if (!fkColumn.endsWith('_id')) fkColumn = fkColumn + '_id';
-          }
-          if (!fkColumn.includes('_')) {
-            fkColumn = ownerMeta.tableName.replace(/s$/, '') + '_id';
-          }
+          const fkColumn = resolveOneToManyFkColumn(relation, ownerMeta, inverseMeta);
 
           const ownerPk = ownerMeta.primaryKeys[0];
           const ownerPkVal = (ownerEntity as Record<string, any>)[ownerPk];
@@ -136,11 +109,9 @@ export function createLazyProxy<T extends object>(
   Object.defineProperty(target, propertyKey, {
     get() {
       if (!loaded) {
-        const promise = load();
-        const thenable = promise as any;
-        thenable.then = promise.then.bind(promise);
-        thenable.catch = promise.catch.bind(promise);
-        return thenable;
+        return load().then((result: any) => {
+          return result;
+        });
       }
       return cache;
     },
@@ -153,6 +124,97 @@ export function createLazyProxy<T extends object>(
   });
 
   return target;
+}
+
+function resolveManyToOneFkValue(
+  relation: RelationMetadata,
+  ownerMeta: EntityMetadata,
+  targetMeta: EntityMetadata,
+  ownerObj: Record<string, any>
+): any {
+  if (relation.foreignKey) {
+    const col = ownerMeta.columns.get(relation.foreignKey);
+    if (col && ownerObj[relation.foreignKey] !== undefined) {
+      return ownerObj[relation.foreignKey];
+    }
+    for (const [propKey, c] of ownerMeta.columns.entries()) {
+      if (c.columnName === relation.foreignKey) {
+        return ownerObj[propKey];
+      }
+    }
+    return ownerObj[relation.foreignKey];
+  }
+
+  const targetName = relation.propertyKey;
+  const candidateProp = targetName + 'Id';
+  if (ownerMeta.columns.has(candidateProp)) {
+    return ownerObj[candidateProp];
+  }
+
+  const candidateCol = metadataStore.snakeCase(targetName) + '_id';
+  for (const [propKey, col] of ownerMeta.columns.entries()) {
+    if (col.columnName === candidateCol) {
+      return ownerObj[propKey];
+    }
+  }
+
+  for (const [propKey, col] of ownerMeta.columns.entries()) {
+    if (col.columnName.endsWith('_id')) {
+      return ownerObj[propKey];
+    }
+  }
+
+  return ownerObj[ownerMeta.primaryKeys[0]];
+}
+
+function resolveOneToManyFkColumn(
+  relation: RelationMetadata,
+  ownerMeta: EntityMetadata,
+  inverseMeta: EntityMetadata
+): string {
+  if (relation.mappedBy) {
+    const inverseRel = inverseMeta.relations.get(relation.mappedBy);
+    if (inverseRel?.foreignKey) {
+      const col = inverseMeta.columns.get(inverseRel.foreignKey);
+      if (col) return col.columnName;
+      return inverseRel.foreignKey;
+    }
+
+    const candidateProp = relation.mappedBy + 'Id';
+    if (inverseMeta.columns.has(candidateProp)) {
+      return inverseMeta.columns.get(candidateProp)!.columnName;
+    }
+
+    const candidateCol = metadataStore.snakeCase(relation.mappedBy) + '_id';
+    for (const [, col] of inverseMeta.columns.entries()) {
+      if (col.columnName === candidateCol) {
+        return col.columnName;
+      }
+    }
+
+    for (const [, col] of inverseMeta.columns.entries()) {
+      if (col.columnName.endsWith('_id')) {
+        return col.columnName;
+      }
+    }
+  }
+
+  const ownerTableName = ownerMeta.tableName;
+  const singular = ownerTableName.replace(/s$/, '');
+  const candidateCol = singular + '_id';
+  for (const [, col] of inverseMeta.columns.entries()) {
+    if (col.columnName === candidateCol) {
+      return col.columnName;
+    }
+  }
+
+  for (const [, col] of inverseMeta.columns.entries()) {
+    if (col.columnName.endsWith('_id')) {
+      return col.columnName;
+    }
+  }
+
+  return candidateCol;
 }
 
 function getDefaultJoinTableName(

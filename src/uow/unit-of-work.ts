@@ -50,13 +50,19 @@ export class UnitOfWork {
   }
 
   async findById<T extends object>(entityClass: EntityClass<T>, id: any): Promise<T | null> {
-    const meta = metadataStore.getEntityMetadataOrThrow(entityClass);
+    const meta = metadataStore.getEntityMetadata(entityClass);
+    if (!meta) {
+      return null;
+    }
     const pkProp = meta.primaryKeys[0];
     const pkCol = meta.columns.get(pkProp)!.columnName;
 
     const idStr = String(id);
     const cached = this.identityMap.get(entityClass, idStr);
-    if (cached) return cached as T;
+    if (cached) {
+      this.postLoadProcess(cached, entityClass);
+      return cached as T;
+    }
 
     const qb = QueryBuilder.forEntity(entityClass).where(pkCol, '=', id);
     const built = qb.buildSelect();

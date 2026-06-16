@@ -64,13 +64,28 @@ export class EagerLoader {
 
       switch (plan.relation.type) {
         case 'many-to-one': {
-          let fkCol: string;
+          let fkCol: string = '';
           if (plan.relation.foreignKey) {
-            fkCol = plan.relation.foreignKey;
-          } else if (ownerMeta.columns.has(plan.propertyPath)) {
-            fkCol = ownerMeta.columns.get(plan.propertyPath)!.columnName;
+            const col = ownerMeta.columns.get(plan.relation.foreignKey);
+            fkCol = col ? col.columnName : plan.relation.foreignKey;
           } else {
-            fkCol = plan.propertyPath + '_id';
+            const candidateProp = plan.propertyPath + 'Id';
+            if (ownerMeta.columns.has(candidateProp)) {
+              fkCol = ownerMeta.columns.get(candidateProp)!.columnName;
+            } else {
+              const candidateCol = metadataStore.snakeCase(plan.propertyPath) + '_id';
+              let found = false;
+              for (const [, col] of ownerMeta.columns.entries()) {
+                if (col.columnName === candidateCol) {
+                  fkCol = col.columnName;
+                  found = true;
+                  break;
+                }
+              }
+              if (!found) {
+                fkCol = candidateCol;
+              }
+            }
           }
           onClause = `${ownerAlias}.${fkCol} = ${plan.alias}.${targetPkCol}`;
           break;
@@ -79,16 +94,29 @@ export class EagerLoader {
         case 'one-to-many': {
           const inverseMeta = targetMeta;
           const mappedBy = plan.relation.mappedBy!;
-          const inverseRel = inverseMeta.relations.get(mappedBy);
 
-          let fkColumn: string;
+          let fkColumn: string = '';
+          const inverseRel = inverseMeta.relations.get(mappedBy);
           if (inverseRel?.foreignKey) {
-            fkColumn = inverseRel.foreignKey;
+            const col = inverseMeta.columns.get(inverseRel.foreignKey);
+            fkColumn = col ? col.columnName : inverseRel.foreignKey;
           } else {
-            const ownerPkProp = ownerMeta.primaryKeys[0];
-            fkColumn = metadataStore.getColumnName(plan.ownerClass, ownerPkProp);
-            if (!fkColumn.includes('_id')) {
-              fkColumn = ownerMeta.tableName.replace(/s$/, '') + '_id';
+            const candidateProp = mappedBy + 'Id';
+            if (inverseMeta.columns.has(candidateProp)) {
+              fkColumn = inverseMeta.columns.get(candidateProp)!.columnName;
+            } else {
+              const candidateCol = metadataStore.snakeCase(mappedBy) + '_id';
+              let found = false;
+              for (const [, col] of inverseMeta.columns.entries()) {
+                if (col.columnName === candidateCol) {
+                  fkColumn = col.columnName;
+                  found = true;
+                  break;
+                }
+              }
+              if (!found) {
+                fkColumn = ownerMeta.tableName.replace(/s$/, '') + '_id';
+              }
             }
           }
           const ownerPkCol = ownerMeta.columns.get(ownerMeta.primaryKeys[0])!.columnName;

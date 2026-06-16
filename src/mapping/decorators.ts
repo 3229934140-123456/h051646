@@ -124,6 +124,7 @@ export function ManyToMany<T>(
 export function JoinColumn(name: string): PropertyDecorator {
   return function (target: Object, propertyKey: string | symbol) {
     const key = String(propertyKey);
+    Reflect.defineMetadata(`orm:joinColumn:${key}`, name, target.constructor);
     const meta = metadataStore.getEntityMetadata(target.constructor as EntityClass<unknown>);
     if (meta && meta.relations.has(key)) {
       const rel = meta.relations.get(key)!;
@@ -136,6 +137,7 @@ export function JoinColumn(name: string): PropertyDecorator {
 export function JoinTable(name: string): PropertyDecorator {
   return function (target: Object, propertyKey: string | symbol) {
     const key = String(propertyKey);
+    Reflect.defineMetadata(`orm:joinTable:${key}`, name, target.constructor);
     const meta = metadataStore.getEntityMetadata(target.constructor as EntityClass<unknown>);
     if (meta && meta.relations.has(key)) {
       const rel = meta.relations.get(key)!;

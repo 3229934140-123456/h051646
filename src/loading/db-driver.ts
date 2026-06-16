@@ -107,7 +107,12 @@ export class MemoryDbDriver implements DbDriver {
   }
 
   private executeSelect(sql: string, params: any[]): DbRow[] {
-    if (/JOIN/i.test(sql)) {
+    const joinCount = (sql.match(/JOIN/gi) || []).length;
+    if (joinCount >= 2) {
+      const result = this.parseMultiJoinSelect(sql, params);
+      if (result) return result;
+    }
+    if (joinCount === 1) {
       const joinMatch = this.parseJoinSelect(sql, params);
       if (joinMatch) return joinMatch;
     }
@@ -166,21 +171,138 @@ export class MemoryDbDriver implements DbDriver {
     });
   }
 
+  private parseMultiJoinSelect(sql: string, params: any[]): DbRow[] | null {
+    const selectMatch = sql.match(/SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?\s*/i);
+    if (!selectMatch) return null;
+
+    let [, columns, mainTable, mainAlias] = selectMatch;
+    const keywords = new Set(['LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS', 'FULL', 'WHERE', 'ON', 'GROUP', 'ORDER', 'LIMIT', 'HAVING']);
+    if (mainAlias && keywords.has(mainAlias.toUpperCase())) mainAlias = '';
+    const resolvedMainAlias = mainAlias || mainTable;
+    const mainData = this.tables.get(mainTable) || [];
+
+    const joinRegex = /(LEFT|INNER|RIGHT)\s+JOIN\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?\s+ON\s+([\w.]+\s*=\s*[\w.]+)/gi;
+    const joins: Array<{
+      type: string;
+      table: string;
+      alias: string;
+      onLeft: string;
+      onRight: string;
+    }> = [];
+
+    let joinMatch;
+    while ((joinMatch = joinRegex.exec(sql)) !== null) {
+      let [, jType, jTable, jAlias, onClause] = joinMatch;
+      if (jAlias && keywords.has(jAlias.toUpperCase())) jAlias = '';
+      const alias = jAlias || jTable;
+      const onParts = onClause.split('=').map((s: string) => s.trim());
+      joins.push({
+        type: jType.toUpperCase(),
+        table: jTable,
+        alias,
+        onLeft: onParts[0],
+        onRight: onParts[1],
+      });
+    }
+
+    if (joins.length === 0) return null;
+
+    const whereMatch = sql.match(/WHERE\s+(.+?)(?:\s+GROUP|\s+ORDER|\s+LIMIT|\s*$)/i);
+    const whereClause = whereMatch ? whereMatch[1].trim() : null;
+
+    let results: DbRow[] = mainData.map((row) => {
+      const combined: DbRow = {};
+      for (const [k, v] of Object.entries(row)) {
+        combined[k] = v;
+        combined[`${resolvedMainAlias}_${k}`] = v;
+      }
+      return combined;
+    });
+
+    for (const join of joins) {
+      const joinData = this.tables.get(join.table) || [];
+      const newResults: DbRow[] = [];
+
+      const resolveOnCol = (onStr: string, row: DbRow): { alias: string; col: string; val: any } => {
+        if (onStr.includes('.')) {
+          const [a, c] = onStr.split('.');
+          return { alias: a, col: c, val: row[`${a}_${c}`] ?? row[c] };
+        }
+        return { alias: '', col: onStr, val: row[onStr] };
+      };
+
+      for (const resultRow of results) {
+        const leftOn = resolveOnCol(join.onLeft, resultRow);
+        const rightOn = resolveOnCol(join.onRight, resultRow);
+
+        let lookupVal: any;
+        let resultCol: string;
+
+        if (leftOn.alias === join.alias) {
+          resultCol = leftOn.col;
+          lookupVal = resultRow[`${rightOn.alias}_${rightOn.col}`] ?? resultRow[rightOn.col];
+        } else if (rightOn.alias === join.alias) {
+          resultCol = rightOn.col;
+          lookupVal = resultRow[`${leftOn.alias}_${leftOn.col}`] ?? resultRow[leftOn.col];
+        } else if (leftOn.val === undefined) {
+          resultCol = leftOn.col;
+          lookupVal = resultRow[`${rightOn.alias}_${rightOn.col}`] ?? resultRow[rightOn.col];
+        } else {
+          resultCol = rightOn.col;
+          lookupVal = resultRow[`${leftOn.alias}_${leftOn.col}`] ?? resultRow[leftOn.col];
+        }
+
+        const matched = joinData.filter((jr) => jr[resultCol] === lookupVal);
+
+        if (matched.length === 0 && join.type === 'LEFT') {
+          const combined = { ...resultRow };
+          if (joinData.length > 0) {
+            for (const k of Object.keys(joinData[0])) {
+              combined[`${join.alias}_${k}`] = null;
+            }
+          }
+          newResults.push(combined);
+        } else {
+          for (const jRow of matched) {
+            const combined = { ...resultRow };
+            for (const [k, v] of Object.entries(jRow)) {
+              combined[`${join.alias}_${k}`] = v;
+            }
+            newResults.push(combined);
+          }
+        }
+      }
+
+      results = newResults;
+    }
+
+    if (whereClause) {
+      results = this.applyWhere(results, whereClause, params);
+    }
+
+    return results;
+  }
+
   private parseJoinSelect(sql: string, params: any[]): DbRow[] | null {
     const joinPattern =
-      /SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+AS\s+(\w+))?\s+(LEFT|INNER|RIGHT)\s+JOIN\s+(\w+)(?:\s+AS\s+(\w+))?\s+ON\s+(.+?)(?:\s+WHERE\s+(.+?))?(?:\s+GROUP\s+BY\s+(.+?))?(?:\s+ORDER\s+BY\s+(.+?))?(?:\s+LIMIT\s+\$?(\d+))?\s*$/i;
+      /SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?\s+(LEFT|INNER|RIGHT)\s+JOIN\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?\s+ON\s+(.+?)(?:\s+WHERE\s+(.+?))?(?:\s+GROUP\s+BY\s+(.+?))?(?:\s+ORDER\s+BY\s+(.+?))?(?:\s+LIMIT\s+\$?(\d+))?\s*$/i;
     const m = sql.match(joinPattern);
     if (!m) return null;
 
-    const [, columns, mainTable, mainAlias, joinType, joinTable, joinAlias, onCond, where, groupBy, orderBy, limitStr] = m;
+    let [, columns, mainTable, mainAlias, joinType, joinTable, joinAlias, onCond, where, groupBy, orderBy, limitStr] = m;
+    const keywords = new Set(['LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS', 'FULL', 'WHERE', 'ON', 'GROUP', 'ORDER', 'LIMIT', 'HAVING']);
+    if (mainAlias && keywords.has(mainAlias.toUpperCase())) mainAlias = '';
+    if (joinAlias && keywords.has(joinAlias.toUpperCase())) joinAlias = '';
     const mainData = this.tables.get(mainTable) || [];
     const joinData = this.tables.get(joinTable) || [];
 
     const onMatch = onCond.match(/(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)/i);
     if (!onMatch) return null;
     const [, t1, c1, t2, c2] = onMatch;
-    const leftCol = t1 === (mainAlias || mainTable) ? c1 : c2;
-    const rightCol = t2 === (joinAlias || joinTable) ? c2 : c1;
+    const resolvedMainAlias = mainAlias || mainTable;
+    const resolvedJoinAlias = joinAlias || joinTable;
+    const leftCol = t1 === resolvedMainAlias ? c1 : c2;
+    const rightCol = t2 === resolvedJoinAlias ? c2 : c1;
 
     let results: DbRow[] = [];
     for (const mainRow of mainData) {
@@ -189,10 +311,10 @@ export class MemoryDbDriver implements DbDriver {
         const combined: DbRow = {};
         for (const [k, v] of Object.entries(mainRow)) {
           combined[k] = v;
-          combined[`${mainAlias || mainTable}_${k}`] = v;
+          combined[`${resolvedMainAlias}_${k}`] = v;
         }
         for (const k of Object.keys(joinData[0] || {})) {
-          combined[`${joinAlias || joinTable}_${k}`] = null;
+          combined[`${resolvedJoinAlias}_${k}`] = null;
         }
         results.push(combined);
       } else {
@@ -200,10 +322,10 @@ export class MemoryDbDriver implements DbDriver {
           const combined: DbRow = {};
           for (const [k, v] of Object.entries(mainRow)) {
             combined[k] = v;
-            combined[`${mainAlias || mainTable}_${k}`] = v;
+            combined[`${resolvedMainAlias}_${k}`] = v;
           }
           for (const [k, v] of Object.entries(jRow)) {
-            combined[`${joinAlias || joinTable}_${k}`] = v;
+            combined[`${resolvedJoinAlias}_${k}`] = v;
           }
           results.push(combined);
         }
@@ -274,7 +396,7 @@ export class MemoryDbDriver implements DbDriver {
   }
 
   private evaluateSingleCondition(row: DbRow, cond: string): boolean {
-    const inMatch = cond.match(/(\w+)\s+(NOT\s+)?IN\s*\((.+?)\)\s*$/i);
+    const inMatch = cond.match(/([\w.]+)\s+(NOT\s+)?IN\s*\((.+?)\)\s*$/i);
     if (inMatch) {
       const [, col, not, valuesStr] = inMatch;
       const values = valuesStr.split(',').map((v) => {
@@ -289,14 +411,14 @@ export class MemoryDbDriver implements DbDriver {
       return not ? !inList : inList;
     }
 
-    const nullMatch = cond.match(/(\w+)\s+IS\s+(NOT\s+)?NULL\s*$/i);
+    const nullMatch = cond.match(/([\w.]+)\s+IS\s+(NOT\s+)?NULL\s*$/i);
     if (nullMatch) {
       const [, col, not] = nullMatch;
       const val = this.getRowValue(row, col);
       return not ? val !== null : val === null;
     }
 
-    const betweenMatch = cond.match(/(\w+)\s+BETWEEN\s+(.+?)\s+AND\s+(.+?)\s*$/i);
+    const betweenMatch = cond.match(/([\w.]+)\s+BETWEEN\s+(.+?)\s+AND\s+(.+?)\s*$/i);
     if (betweenMatch) {
       const [, col, minStr, maxStr] = betweenMatch;
       const val = this.getRowValue(row, col);
@@ -305,7 +427,7 @@ export class MemoryDbDriver implements DbDriver {
       return val >= min && val <= max;
     }
 
-    const likeMatch = cond.match(/(\w+)\s+(NOT\s+)?LIKE\s+'(.+?)'\s*$/i);
+    const likeMatch = cond.match(/([\w.]+)\s+(NOT\s+)?LIKE\s+'(.+?)'\s*$/i);
     if (likeMatch) {
       const [, col, not, pattern] = likeMatch;
       const val = String(this.getRowValue(row, col) ?? '');
@@ -316,7 +438,7 @@ export class MemoryDbDriver implements DbDriver {
       return not ? !regex.test(val) : regex.test(val);
     }
 
-    const opMatch = cond.match(/(\w+)\s*(=|!=|<>|<=|>=|<|>)\s*(.+?)\s*$/);
+    const opMatch = cond.match(/([\w.]+)\s*(=|!=|<>|<=|>=|<|>)\s*(.+?)\s*$/);
     if (opMatch) {
       const [, col, op, valStr] = opMatch;
       const rowVal = this.getRowValue(row, col);
