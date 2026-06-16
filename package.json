@@ -1,0 +1,20 @@
+{
+  "name": "mini-orm",
+  "version": "1.0.0",
+  "description": "A lightweight ORM framework with entity mapping, query builder, result mapping, lazy/eager loading, and unit of work",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/example.js",
+    "dev": "ts-node src/example.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3",
+    "ts-node": "^10.9.2"
+  },
+  "dependencies": {
+    "reflect-metadata": "^0.2.1"
+  }
+}
