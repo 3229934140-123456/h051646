@@ -38,7 +38,7 @@ export class EagerLoader {
 
     for (const relPath of options.relations) {
       const plan = this.resolveRelationPath(entityClass, relPath, nextAlias);
-      if (plan) plans.push(plan);
+      plans.push(plan);
     }
 
     const columns: Array<string | { expression: string; alias: string }> = ['root.*'];
@@ -186,18 +186,23 @@ export class EagerLoader {
     path: string,
     nextAlias: () => string,
     parentAlias?: string
-  ): EagerPlan | null {
+  ): EagerPlan {
     const parts = path.split('.');
     let currentClass = entityClass;
     let currentAlias = parentAlias;
 
     for (let i = 0; i < parts.length; i++) {
       const propName = parts[i];
-      const meta = metadataStore.getEntityMetadata(currentClass);
-      if (!meta) return null;
+      const meta = metadataStore.getEntityMetadataOrThrow(currentClass);
 
       const rel = meta.relations.get(propName);
-      if (!rel) return null;
+      if (!rel) {
+        const available = Array.from(meta.relations.keys()).join(', ') || '(none)';
+        throw new Error(
+          `[ORM] Eager load relation '${propName}' not found on entity '${meta.entityName}' (table '${meta.tableName}'). ` +
+          `Available relations: ${available}. Full path requested: '${path}'`
+        );
+      }
 
       const alias = nextAlias();
       const targetClass = rel.targetEntity() as EntityClass;
@@ -216,7 +221,7 @@ export class EagerLoader {
       currentClass = targetClass;
       currentAlias = alias;
     }
-    return null;
+    throw new Error(`[ORM] Invalid relation path: '${path}'`);
   }
 
   private static getDefaultJoinTableName(

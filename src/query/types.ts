@@ -16,13 +16,20 @@ export type WhereOperator =
 
 export type LogicOperator = 'AND' | 'OR';
 
-export interface WhereCondition {
-  column: string;
-  operator: WhereOperator;
-  value?: any;
-  value2?: any;
-  logic?: LogicOperator;
-}
+export type WhereCondition =
+  | {
+      kind: 'condition';
+      column: string;
+      operator: WhereOperator;
+      value?: any;
+      value2?: any;
+      logic?: LogicOperator;
+    }
+  | {
+      kind: 'group';
+      children: WhereCondition[];
+      logic?: LogicOperator;
+    };
 
 export interface OrderByItem {
   column: string;

@@ -7,13 +7,14 @@ import {
 } from '../mapping';
 import { QueryBuilder } from '../query';
 import { TypeConverter, IdentityMap, ResultMapper } from '../result';
-import { DbDriver, applyLazyLoading, LazyLoadContext, EagerLoader, EagerLoadOptions } from '../loading';
+import { DbDriver, applyLazyLoading, LazyLoadContext, EagerLoader, EagerLoadOptions, BatchLoader } from '../loading';
 import { ChangeTracker } from './change-tracker';
 import { EntityState, EntityEntry, CommitResult, SqlStatement } from './types';
 
 export interface UnitOfWorkOptions {
   enableLazyLoading?: boolean;
   trackChanges?: boolean;
+  failNextCommitWith?: Error | string;
 }
 
 export class UnitOfWork {
@@ -22,14 +23,17 @@ export class UnitOfWork {
   private changeTracker: ChangeTracker;
   private options: Required<UnitOfWorkOptions>;
   private executedQueries: Array<{ sql: string; params: any[] }> = [];
+  private preCommitHook?: (entries: EntityEntry[]) => void | Promise<void>;
 
   constructor(driver: DbDriver, options: UnitOfWorkOptions = {}) {
     this.driver = driver;
     this.identityMap = new IdentityMap();
     this.changeTracker = new ChangeTracker();
     this.options = {
-      enableLazyLoading: options.enableLazyLoading ?? true,
-      trackChanges: options.trackChanges ?? true,
+      enableLazyLoading: true,
+      trackChanges: true,
+      failNextCommitWith: '',
+      ...options,
     };
   }
 
@@ -198,6 +202,10 @@ export class UnitOfWork {
     const statements = this.buildSqlStatements();
     const sortedStatements = this.sortByDependency(statements);
 
+    if (typeof this.driver.saveSnapshot === 'function') {
+      this.driver.saveSnapshot();
+    }
+
     const result: CommitResult = {
       inserted: 0,
       updated: 0,
@@ -206,61 +214,89 @@ export class UnitOfWork {
       executedQueries: [],
     };
 
-    for (const stmt of sortedStatements) {
-      this.logQuery(stmt.sql, stmt.params);
-      result.executedQueries.push({ sql: stmt.sql, params: stmt.params });
+    try {
+      if (this.preCommitHook) {
+        const allEntries: EntityEntry[] = [];
+        for (const entry of this.changeTracker.getAllEntries()) {
+          allEntries.push(entry);
+        }
+        await this.preCommitHook(allEntries);
+      }
 
-      const execResult = await this.driver.execute(stmt.sql, stmt.params);
+      if (this.options.failNextCommitWith) {
+        const err =
+          typeof this.options.failNextCommitWith === 'string'
+            ? new Error(this.options.failNextCommitWith)
+            : this.options.failNextCommitWith;
+        this.options.failNextCommitWith = '';
+        throw err;
+      }
 
-      switch (stmt.operation) {
-        case 'insert':
-          result.inserted += execResult.rowCount;
-          if (execResult.rows.length > 0 && stmt.entity) {
-            const meta = metadataStore.getEntityMetadata(stmt.entityClass);
-            if (meta) {
-              for (const pk of meta.primaryKeys) {
-                const col = meta.columns.get(pk)!;
-                const generated = execResult.rows[0][col.columnName];
-                if (generated !== undefined && generated !== null) {
-                  (stmt.entity as any)[pk] = generated;
-                  if (!result.generatedIds.has(stmt.entityClass)) {
-                    result.generatedIds.set(stmt.entityClass, new Map());
+      for (const stmt of sortedStatements) {
+        this.logQuery(stmt.sql, stmt.params);
+        result.executedQueries.push({ sql: stmt.sql, params: stmt.params });
+
+        const execResult = await this.driver.execute(stmt.sql, stmt.params);
+
+        switch (stmt.operation) {
+          case 'insert':
+            result.inserted += execResult.rowCount;
+            if (execResult.rows.length > 0 && stmt.entity) {
+              const meta = metadataStore.getEntityMetadata(stmt.entityClass);
+              if (meta) {
+                for (const pk of meta.primaryKeys) {
+                  const col = meta.columns.get(pk)!;
+                  const generated = execResult.rows[0][col.columnName];
+                  if (generated !== undefined && generated !== null) {
+                    (stmt.entity as any)[pk] = generated;
+                    if (!result.generatedIds.has(stmt.entityClass)) {
+                      result.generatedIds.set(stmt.entityClass, new Map());
+                    }
+                    const idKey = meta.primaryKeys.length === 1
+                      ? String(generated)
+                      : meta.primaryKeys.map((p) => String(execResult.rows[0][meta.columns.get(p)!.columnName])).join('::');
+                    result.generatedIds.get(stmt.entityClass)!.set(idKey, generated);
                   }
-                  const idKey = meta.primaryKeys.length === 1
-                    ? String(generated)
-                    : meta.primaryKeys.map((p) => String(execResult.rows[0][meta.columns.get(p)!.columnName])).join('::');
-                  result.generatedIds.get(stmt.entityClass)!.set(idKey, generated);
                 }
               }
             }
-          }
-          break;
-        case 'update':
-          result.updated += execResult.rowCount;
-          break;
-        case 'delete':
-          result.deleted += execResult.rowCount;
-          break;
+            break;
+          case 'update':
+            result.updated += execResult.rowCount;
+            break;
+          case 'delete':
+            result.deleted += execResult.rowCount;
+            break;
+        }
       }
-    }
 
-    for (const [cls, map] of result.generatedIds) {
-      for (const [id, val] of map) {
-        const entries = this.changeTracker.getAllByClass(cls);
-        for (const entry of entries) {
-          const meta = metadataStore.getEntityMetadata(cls);
-          if (meta && meta.primaryKeys.length === 1) {
-            const pk = meta.primaryKeys[0];
-            if ((entry.entity as any)[pk] === val) {
-              this.identityMap.set(cls, id, entry.entity);
+      for (const [cls, map] of result.generatedIds) {
+        for (const [id, val] of map) {
+          const entries = this.changeTracker.getAllByClass(cls);
+          for (const entry of entries) {
+            const meta = metadataStore.getEntityMetadata(cls);
+            if (meta && meta.primaryKeys.length === 1) {
+              const pk = meta.primaryKeys[0];
+              if ((entry.entity as any)[pk] === val) {
+                this.identityMap.set(cls, id, entry.entity);
+              }
             }
           }
         }
       }
-    }
 
-    this.changeTracker.acceptChanges();
-    this.executedQueries.push(...result.executedQueries);
+      this.changeTracker.acceptChanges();
+      this.executedQueries.push(...result.executedQueries);
+
+      if (typeof this.driver.clearSnapshot === 'function') {
+        this.driver.clearSnapshot();
+      }
+    } catch (err) {
+      if (typeof this.driver.restoreSnapshot === 'function') {
+        this.driver.restoreSnapshot();
+      }
+      throw err;
+    }
 
     return result;
   }
@@ -277,6 +313,22 @@ export class UnitOfWork {
     this.changeTracker.clear();
     this.identityMap.clear();
     this.executedQueries = [];
+  }
+
+  async loadRelations<T extends object>(entities: T[], relationPaths: string[]): Promise<void> {
+    const context = {
+      driver: this.driver,
+      identityMap: this.identityMap,
+    };
+    await BatchLoader.loadRelations(entities, relationPaths, context);
+  }
+
+  setPreCommitHook(hook: (entries: EntityEntry[]) => void | Promise<void> | null): void {
+    this.preCommitHook = hook ? ((entries) => { const r = hook(entries); return r === null ? undefined : r; }) : undefined;
+  }
+
+  failNextCommit(error: string | Error): void {
+    this.options.failNextCommitWith = error;
   }
 
   private postLoadProcess<T extends object>(entity: T, entityClass: EntityClass<T>): void {

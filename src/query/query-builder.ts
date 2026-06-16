@@ -90,7 +90,7 @@ export class QueryBuilder<T = any> {
     value?: any,
     logic: LogicOperator = 'AND'
   ): this {
-    const cond: WhereCondition = { column, operator, logic };
+    const cond: WhereCondition = { kind: 'condition', column, operator, logic };
     if (operator !== 'IS NULL' && operator !== 'IS NOT NULL') {
       cond.value = value;
     }
@@ -140,6 +140,7 @@ export class QueryBuilder<T = any> {
     logic: LogicOperator = 'AND'
   ): this {
     const cond: WhereCondition = {
+      kind: 'condition',
       column,
       operator: 'BETWEEN',
       value: min,
@@ -165,6 +166,14 @@ export class QueryBuilder<T = any> {
     return this.where(column, 'LIKE', pattern, logic);
   }
 
+  andWhereLike(column: string, pattern: string): this {
+    return this.whereLike(column, pattern, 'AND');
+  }
+
+  orWhereLike(column: string, pattern: string): this {
+    return this.whereLike(column, pattern, 'OR');
+  }
+
   groupBy(...columns: string[]): this {
     this.groupByColumns.push(...columns);
     return this;
@@ -176,12 +185,33 @@ export class QueryBuilder<T = any> {
     value?: any,
     logic: LogicOperator = 'AND'
   ): this {
-    const cond: WhereCondition = { column, operator, value, logic };
+    const cond: WhereCondition = { kind: 'condition', column, operator, value, logic };
     if (this.havingConditions.length === 0) {
       cond.logic = undefined;
     }
     this.havingConditions.push(cond);
     return this;
+  }
+
+  andGroup(
+    builder: (qb: QueryBuilder<T>) => void,
+    logic: LogicOperator = 'AND'
+  ): this {
+    const childBuilder = new QueryBuilder<T>(this.tableName, this.entityClass!);
+    childBuilder.alias(this.tableAlias || '');
+    builder(childBuilder);
+    const group: WhereCondition = { kind: 'group', children: childBuilder['whereConditions'] };
+    if (this.whereConditions.length === 0) {
+      group.logic = undefined;
+    } else {
+      group.logic = logic;
+    }
+    this.whereConditions.push(group);
+    return this;
+  }
+
+  orGroup(builder: (qb: QueryBuilder<T>) => void): this {
+    return this.andGroup(builder, 'OR');
   }
 
   orderBy(column: string, direction: 'ASC' | 'DESC' = 'ASC'): this {
@@ -336,31 +366,47 @@ export class QueryBuilder<T = any> {
   ): string {
     if (conditions.length === 0) return '';
     return conditions
-      .map((cond, i) => {
-        let expr = '';
-        const col = this.qualify(cond.column);
-        switch (cond.operator) {
-          case 'IS NULL':
-          case 'IS NOT NULL':
-            expr = `${col} ${cond.operator}`;
-            break;
-          case 'IN':
-          case 'NOT IN': {
-            const values = Array.isArray(cond.value) ? cond.value : [cond.value];
-            const placeholders = values.map((v) => pushParam(v)).join(', ');
-            expr = `${col} ${cond.operator} (${placeholders})`;
-            break;
-          }
-          case 'BETWEEN':
-            expr = `${col} BETWEEN ${pushParam(cond.value)} AND ${pushParam(cond.value2)}`;
-            break;
-          default:
-            expr = `${col} ${cond.operator} ${pushParam(cond.value)}`;
-        }
-        const prefix = i === 0 ? '' : `${cond.logic || 'AND'} `;
-        return `${prefix}${expr}`;
-      })
-      .join(' ');
+      .map((cond, i) => this.renderCondition(cond, i === 0, pushParam))
+      .join(' ')
+      .trim();
+  }
+
+  private renderCondition(
+    cond: WhereCondition,
+    isFirst: boolean,
+    pushParam: (v: any) => string
+  ): string {
+    const prefix = isFirst ? '' : `${cond.logic || 'AND'} `;
+    if (cond.kind === 'group') {
+      if (cond.children.length === 0) return '';
+      const inner = cond.children
+        .map((child, i) => this.renderCondition(child, i === 0, pushParam))
+        .join(' ')
+        .trim();
+      if (!inner) return '';
+      return `${prefix}(${inner})`;
+    }
+    let expr = '';
+    const col = this.qualify(cond.column);
+    switch (cond.operator) {
+      case 'IS NULL':
+      case 'IS NOT NULL':
+        expr = `${col} ${cond.operator}`;
+        break;
+      case 'IN':
+      case 'NOT IN': {
+        const values = Array.isArray(cond.value) ? cond.value : [cond.value];
+        const placeholders = values.map((v) => pushParam(v)).join(', ');
+        expr = `${col} ${cond.operator} (${placeholders})`;
+        break;
+      }
+      case 'BETWEEN':
+        expr = `${col} BETWEEN ${pushParam(cond.value)} AND ${pushParam(cond.value2)}`;
+        break;
+      default:
+        expr = `${col} ${cond.operator} ${pushParam(cond.value)}`;
+    }
+    return `${prefix}${expr}`;
   }
 
   private qualify(column: string): string {

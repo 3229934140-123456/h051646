@@ -95,7 +95,17 @@ export class MetadataStore {
   getEntityMetadataOrThrow<T>(target: EntityClass<T>): EntityMetadata {
     const meta = this.entities.get(target);
     if (!meta) {
-      throw new Error(`Entity ${target.name} is not registered`);
+      throw new Error(
+        `[ORM] Entity '${target.name}' is not registered with @Entity() decorator. ` +
+        `Make sure the class is decorated and its module is imported before use.`
+      );
+    }
+    if (meta.primaryKeys.length === 0) {
+      const columnNames = Array.from(meta.columns.keys()).join(', ') || '(no columns)';
+      throw new Error(
+        `[ORM] Entity '${meta.entityName}' (table '${meta.tableName}') has no primary key. ` +
+        `Add a property decorated with @PrimaryKey(). Current columns: ${columnNames}`
+      );
     }
     return meta;
   }

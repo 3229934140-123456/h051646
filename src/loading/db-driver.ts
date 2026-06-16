@@ -5,15 +5,42 @@ export interface DbDriver {
   query<T extends DbRow = DbRow>(sql: string, params?: any[]): Promise<T[]>;
   execute(sql: string, params?: any[]): Promise<{ rowCount: number; rows: DbRow[] }>;
   executeBatch(statements: Array<{ sql: string; params?: any[] }>): Promise<Array<{ rowCount: number; rows: DbRow[] }>>;
+  saveSnapshot?(): void;
+  restoreSnapshot?(): void;
+  clearSnapshot?(): void;
 }
 
 export class MemoryDbDriver implements DbDriver {
   private tables: Map<string, DbRow[]> = new Map();
   private autoIncrement: Map<string, number> = new Map();
+  private snapshotStack: Array<{
+    tables: Map<string, DbRow[]>;
+    autoIncrement: Map<string, number>;
+  }> = [];
   private queryLog: Array<{ sql: string; params: any[] }> = [];
   private enableNPlusOneDetection = false;
   private queryPatterns: Map<string, number> = new Map();
   private nPlusOneThreshold = 3;
+
+  saveSnapshot(): void {
+    const tablesCopy: Map<string, DbRow[]> = new Map();
+    for (const [k, v] of this.tables.entries()) {
+      tablesCopy.set(k, v.map((row) => ({ ...row })));
+    }
+    const autoIncrementCopy: Map<string, number> = new Map(this.autoIncrement);
+    this.snapshotStack.push({ tables: tablesCopy, autoIncrement: autoIncrementCopy });
+  }
+
+  restoreSnapshot(): void {
+    const snap = this.snapshotStack.pop();
+    if (!snap) return;
+    this.tables = snap.tables;
+    this.autoIncrement = snap.autoIncrement;
+  }
+
+  clearSnapshot(): void {
+    this.snapshotStack.pop();
+  }
 
   setNPlusOneDetection(enabled: boolean, threshold: number = 3): void {
     this.enableNPlusOneDetection = enabled;
@@ -118,7 +145,7 @@ export class MemoryDbDriver implements DbDriver {
     }
 
     const match = sql.match(
-      /SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+AS\s+(\w+))?(.*?)(?:\s+LIMIT\s+\$?(\d+))?(?:\s+OFFSET\s+\$?(\d+))?\s*$/i
+      /SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?(.*?)(?:\s+LIMIT\s+\$?(\d+))?(?:\s+OFFSET\s+\$?(\d+))?\s*$/i
     );
     if (!match) {
       return [];
@@ -126,6 +153,14 @@ export class MemoryDbDriver implements DbDriver {
 
     const [, columns, table, , restClause, limitStr, offsetStr] = match;
     const { whereClause, orderBy, groupBy } = this.extractClauses(restClause || '');
+
+    if (!this.tables.has(table)) {
+      console.warn(
+        `[ORM] Query warning: table '${table}' does not exist in memory database. ` +
+        `Returning empty result. Available tables: ${Array.from(this.tables.keys()).join(', ') || '(none)'}`
+      );
+      return [];
+    }
 
     const data = this.tables.get(table) || [];
     let filtered = this.applyWhere(data, whereClause, params);
@@ -157,14 +192,17 @@ export class MemoryDbDriver implements DbDriver {
       for (const col of colNames) {
         const aliasMatch = col.match(/(.+?)\s+AS\s+(\w+)$/i);
         if (aliasMatch) {
-          const [, expr, alias] = aliasMatch;
+          const [, rawExpr, alias] = aliasMatch;
+          const expr = rawExpr.trim();
           if (expr.includes('COUNT') || expr.includes('count')) {
             result[alias] = filtered.length;
           } else {
-            result[alias] = r[expr.trim()];
+            const srcKey = expr.includes('.') ? expr.split('.').pop()! : expr;
+            result[alias] = r[srcKey];
           }
         } else {
-          result[col] = r[col];
+          const srcKey = col.includes('.') ? col.split('.').pop()! : col;
+          result[srcKey] = r[srcKey];
         }
       }
       return result;
@@ -179,6 +217,13 @@ export class MemoryDbDriver implements DbDriver {
     const keywords = new Set(['LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS', 'FULL', 'WHERE', 'ON', 'GROUP', 'ORDER', 'LIMIT', 'HAVING']);
     if (mainAlias && keywords.has(mainAlias.toUpperCase())) mainAlias = '';
     const resolvedMainAlias = mainAlias || mainTable;
+    if (!this.tables.has(mainTable)) {
+      console.warn(
+        `[ORM] Query warning: table '${mainTable}' does not exist in memory database. ` +
+        `Available tables: ${Array.from(this.tables.keys()).join(', ') || '(none)'}`
+      );
+      return [];
+    }
     const mainData = this.tables.get(mainTable) || [];
 
     const joinRegex = /(LEFT|INNER|RIGHT)\s+JOIN\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?\s+ON\s+([\w.]+\s*=\s*[\w.]+)/gi;
@@ -220,6 +265,12 @@ export class MemoryDbDriver implements DbDriver {
     });
 
     for (const join of joins) {
+      if (!this.tables.has(join.table)) {
+        console.warn(
+          `[ORM] Query warning: join table '${join.table}' does not exist in memory database. ` +
+          `Returning empty result for joined columns. Available tables: ${Array.from(this.tables.keys()).join(', ') || '(none)'}`
+        );
+      }
       const joinData = this.tables.get(join.table) || [];
       const newResults: DbRow[] = [];
 
@@ -293,6 +344,16 @@ export class MemoryDbDriver implements DbDriver {
     const keywords = new Set(['LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS', 'FULL', 'WHERE', 'ON', 'GROUP', 'ORDER', 'LIMIT', 'HAVING']);
     if (mainAlias && keywords.has(mainAlias.toUpperCase())) mainAlias = '';
     if (joinAlias && keywords.has(joinAlias.toUpperCase())) joinAlias = '';
+    if (!this.tables.has(mainTable) || !this.tables.has(joinTable)) {
+      const missing: string[] = [];
+      if (!this.tables.has(mainTable)) missing.push(mainTable);
+      if (!this.tables.has(joinTable)) missing.push(joinTable);
+      console.warn(
+        `[ORM] Query warning: table(s) '${missing.join(', ')}' do not exist in memory database. ` +
+        `Available tables: ${Array.from(this.tables.keys()).join(', ') || '(none)'}`
+      );
+      return [];
+    }
     const mainData = this.tables.get(mainTable) || [];
     const joinData = this.tables.get(joinTable) || [];
 
@@ -364,35 +425,71 @@ export class MemoryDbDriver implements DbDriver {
     };
     cleaned = cleaned.replace(/\$\d+/g, () => replaceParam());
 
-    const conditions = this.splitConditions(cleaned);
-
-    return data.filter((row) => this.evaluateConditions(row, conditions));
+    return data.filter((row) => this.evaluateExpression(row, cleaned));
   }
 
-  private splitConditions(expr: string): Array<{ logic?: string; cond: string }> {
-    const result: Array<{ logic?: string; cond: string }> = [];
-    const parts = expr.split(/\s+(AND|OR)\s+/i);
-    if (parts.length === 1) {
-      result.push({ cond: parts[0].trim() });
-    } else {
-      result.push({ cond: parts[0].trim() });
-      for (let i = 1; i < parts.length; i += 2) {
-        result.push({ logic: parts[i].toUpperCase(), cond: parts[i + 1]?.trim() || '' });
+  private evaluateExpression(row: DbRow, expr: string): boolean {
+    const trimmed = expr.trim();
+    if (!trimmed) return true;
+
+    const orParts = this.splitTopLevel(trimmed, 'OR');
+    if (orParts.length > 1) {
+      return orParts.some((part) => this.evaluateExpression(row, part));
+    }
+
+    const andParts = this.splitTopLevel(trimmed, 'AND');
+    if (andParts.length > 1) {
+      return andParts.every((part) => this.evaluateExpression(row, part));
+    }
+
+    if (trimmed.startsWith('(') && trimmed.endsWith(')') && this.isMatchingOuterParens(trimmed)) {
+      return this.evaluateExpression(row, trimmed.slice(1, -1));
+    }
+
+    return this.evaluateSingleCondition(row, trimmed);
+  }
+
+  private splitTopLevel(expr: string, op: 'AND' | 'OR'): string[] {
+    const parts: string[] = [];
+    let depth = 0;
+    let current = '';
+    const upper = expr.toUpperCase();
+    const opUpper = op;
+    let i = 0;
+    while (i < expr.length) {
+      const ch = expr[i];
+      if (ch === '(') depth++;
+      else if (ch === ')') depth--;
+
+      if (
+        depth === 0 &&
+        upper.substr(i, opUpper.length) === opUpper &&
+        (i === 0 || /\s/.test(expr[i - 1])) &&
+        (i + opUpper.length >= expr.length || /\s/.test(expr[i + opUpper.length]))
+      ) {
+        if (current.trim()) parts.push(current.trim());
+        current = '';
+        i += opUpper.length;
+      } else {
+        current += ch;
+        i++;
       }
     }
-    return result;
+    if (current.trim()) parts.push(current.trim());
+    return parts;
   }
 
-  private evaluateConditions(row: DbRow, conditions: Array<{ logic?: string; cond: string }>): boolean {
-    if (conditions.length === 0) return true;
-    let result = this.evaluateSingleCondition(row, conditions[0].cond);
-    for (let i = 1; i < conditions.length; i++) {
-      const c = conditions[i];
-      const val = this.evaluateSingleCondition(row, c.cond);
-      if (c.logic === 'OR') result = result || val;
-      else result = result && val;
+  private isMatchingOuterParens(expr: string): boolean {
+    if (!expr.startsWith('(')) return false;
+    let depth = 0;
+    for (let i = 0; i < expr.length; i++) {
+      if (expr[i] === '(') depth++;
+      else if (expr[i] === ')') {
+        depth--;
+        if (depth === 0) return i === expr.length - 1;
+      }
     }
-    return result;
+    return false;
   }
 
   private evaluateSingleCondition(row: DbRow, cond: string): boolean {
